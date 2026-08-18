@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -30,6 +31,11 @@ const welcomeMessage = `🎟 ትኬት ይግዙ iPhone 17 Pro Max ይሸለሙ!
 const miniAppURL = "https://afro.blessed-equb.com"
 const supportURL = "https://t.me/afroequb"
 const pingURL = "https://affrbot.onrender.com"
+
+func pingHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"message": "pong"}`)
+}
 
 func keepAlive(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Minute)
@@ -114,6 +120,18 @@ func main() {
 	ctx := context.Background()
 
 	go keepAlive(ctx)
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "3000"
+	}
+
+	http.HandleFunc("/", pingHandler)
+	go func() {
+		if err := http.ListenAndServe(":"+port, nil); err != nil {
+			log.Fatalf("http server failed: %v", err)
+		}
+	}()
 
 	b, err := bot.New(token)
 	if err != nil {
