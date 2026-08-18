@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"context"
 	"log"
+	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
@@ -27,6 +29,32 @@ const welcomeMessage = `🎟 ትኬት ይግዙ iPhone 17 Pro Max ይሸለሙ!
 
 const miniAppURL = "https://afro.blessed-equb.com"
 const supportURL = "https://t.me/afroequb"
+const pingURL = "https://affrbot.onrender.com"
+
+func keepAlive(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, pingURL, nil)
+			if err != nil {
+				log.Printf("failed to create ping request: %v", err)
+				continue
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				log.Printf("ping failed: %v", err)
+				continue
+			}
+			resp.Body.Close()
+			log.Printf("pinged %s (status %d)", pingURL, resp.StatusCode)
+		}
+	}
+}
 
 func loadEnv(path string) {
 	f, err := os.Open(path)
@@ -84,6 +112,8 @@ func main() {
 	}
 
 	ctx := context.Background()
+
+	go keepAlive(ctx)
 
 	b, err := bot.New(token)
 	if err != nil {
