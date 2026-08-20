@@ -26,7 +26,19 @@ const welcomeMessage = `🎟 ትኬት ይግዙ iPhone 17 Pro Max ይሸለሙ!
 
 አሁኑኑ የእድል ቁጥርዎን ይምረጡ! እድልዎ ዛሬ ነው! ⏳
 
+ትኬት እንዴት እንደሚገዙ /help ብለው ይላኩ
+
 ለማንኛውም ጥያቄ እኛን ያነጋግሩን @AfroEqub`
+
+const helpMessage = `ትኬቱን ለመግዛት ይሄንን መንገድ ይከተሉ! 🎟
+
+1️⃣ ቦቱ ላይ ከተመዘገቡ በኋላ (http://t.me/afroequb_bot) የእድል ቁጥር ይመረጡ የሚለን በመንካት እድል ቁጥር መምረጥ
+2️⃣ በመቀጠል ክፍያ ይፈፅሙ የሚለውን በመንካት ከላይ በሚመጣላቹ ስልክ ቁጥር
+3️⃣ ወደቴሌብር በመሄድ 500 ብር መላክ
+4️⃣ የላኩበትን ደረሰኝ screenshot በማንሳት ወደቦቱ መመለስ
+5️⃣ ያነሱትን ደረሰኝ choose file በማለት መላክ
+
+ማንኛውም ችግር ወይም ግር ያሎት ነገር ካለ እኛን ያነጋግሩን @afroequb`
 
 const miniAppURL = "https://afro.blessed-equb.com"
 const supportURL = "https://t.me/afroequb"
@@ -83,6 +95,24 @@ func loadEnv(path string) {
 	}
 }
 
+func sendDepositVideo(ctx context.Context, b *bot.Bot, chatID int64, caption string) {
+	fileData, err := os.ReadFile("afro equb deposit.mp4")
+	if err != nil {
+		log.Printf("failed to read video: %v", err)
+		return
+	}
+
+	video := &models.InputFileUpload{Filename: "afro equb deposit.mp4", Data: bytes.NewReader(fileData)}
+
+	if _, err := b.SendVideo(ctx, &bot.SendVideoParams{
+		ChatID:  chatID,
+		Video:   video,
+		Caption: caption,
+	}); err != nil {
+		log.Printf("failed to send video: %v", err)
+	}
+}
+
 func startHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 	keyboard := &models.InlineKeyboardMarkup{
 		InlineKeyboard: [][]models.InlineKeyboardButton{
@@ -107,6 +137,12 @@ func startHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 	}); err != nil {
 		log.Printf("failed to send welcome: %v", err)
 	}
+
+	sendDepositVideo(ctx, b, update.Message.Chat.ID, "")
+}
+
+func helpHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
+	sendDepositVideo(ctx, b, update.Message.Chat.ID, helpMessage)
 }
 
 func main() {
@@ -146,6 +182,7 @@ func main() {
 	log.Printf("authorized on account %s", me.Username)
 
 	b.RegisterHandler(bot.HandlerTypeMessageText, "/start", bot.MatchTypeExact, startHandler)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "/help", bot.MatchTypeExact, helpHandler)
 
 	b.Start(ctx)
 }
