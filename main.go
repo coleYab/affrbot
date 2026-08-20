@@ -96,13 +96,14 @@ func loadEnv(path string) {
 }
 
 func sendDepositVideo(ctx context.Context, b *bot.Bot, chatID int64, caption string) {
-	fileData, err := os.ReadFile("afro equb deposit.mp4")
+	f, err := os.Open("afro equb deposit.mp4")
 	if err != nil {
-		log.Printf("failed to read video: %v", err)
+		log.Printf("failed to open video: %v", err)
 		return
 	}
+	defer f.Close()
 
-	video := &models.InputFileUpload{Filename: "afro equb deposit.mp4", Data: bytes.NewReader(fileData)}
+	video := &models.InputFileUpload{Filename: "afro equb deposit.mp4", Data: f}
 
 	if _, err := b.SendVideo(ctx, &bot.SendVideoParams{
 		ChatID:  chatID,
