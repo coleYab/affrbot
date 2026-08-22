@@ -8,9 +8,9 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"mime/multipart"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,67 +20,77 @@ import (
 	"github.com/go-telegram/bot/models"
 )
 
+// ==================== Data ====================
+
+type Booking struct {
+	ID          int       `json:"id"`
+	UserID      int64     `json:"user_id"`
+	UserName    string    `json:"user_name"`
+	UserPhone   string    `json:"user_phone"`
+	TicketNum   int       `json:"ticket_number"`
+	Status      string    `json:"status"` // PENDING, PAID, CONFIRMED
+	ReceiptFile string    `json:"receipt_file,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+type bookingsFile struct {
+	NextID   int       `json:"next_id"`
+	Bookings []Booking `json:"bookings"`
+}
+
 // ==================== State ====================
 
 type Step string
 
 const (
-	Idle            Step = ""
-	AwaitTicket     Step = "await_ticket"     // waiting for user to type a number
-	AwaitConfirm    Step = "await_confirm"     // waiting for confirm/cancel button
-	AwaitReceipt    Step = "await_receipt"     // waiting for photo
+	Idle       Step = ""
+	AwaitNum   Step = "await_num"
+	AwaitPhone Step = "await_phone"
+	AwaitConfirm Step = "await_confirm"
+	AwaitReceipt Step = "await_receipt"
 )
 
-type State struct {
-	Step      Step
-	TicketNum int
-	PaymentID int
+type UserState struct {
+	Step    Step
+	Ticket  int
+	Phone   string
 }
 
 var (
-	states   = map[int64]*State{}
+	states   = map[int64]*UserState{}
 	statesMu sync.Mutex
 )
 
-func getState(chatID int64) *State {
-	statesMu.Lock()
-	defer statesMu.Unlock()
-	return states[chatID]
-}
-
-func setState(chatID int64, s *State) {
-	statesMu.Lock()
-	defer statesMu.Unlock()
-	states[chatID] = s
-}
-
-func clearState(chatID int64) {
-	statesMu.Lock()
-	defer statesMu.Unlock()
-	delete(states, chatID)
-}
+func getState(id int64) *UserState { statesMu.Lock(); defer statesMu.Unlock(); return states[id] }
+func setState(id int64, s *UserState) { statesMu.Lock(); defer statesMu.Unlock(); states[id] = s }
+func clearState(id int64) { statesMu.Lock(); defer statesMu.Unlock(); delete(states, id) }
 
 // ==================== Config ====================
 
 var (
-	apiBase    = "https://afro.blessed-equb.com/api/bot"
-	miniAppURL = "https://afro.blessed-equb.com"
-	supportURL = "https://t.me/afroequb"
-	botToken   string // Telegram bot token for downloading files
+	adminIDs    []int64
+	paymentAcct = "0955885207"
+	paymentName = "yirgalem"
+	price       = 500
+	dataDir     = "data"
+	miniAppURL  = "https://afro.blessed-equb.com"
+	supportURL  = "https://t.me/afroequb"
+	botTokenStr string
 )
 
 // ==================== Callback data ====================
 
 const (
-	cbBook       = "BOOK"
-	cbConfirm    = "CONFIRM"
-	cbCancel     = "CANCEL"
-	cbHelp       = "HELP"
-	cbSupport    = "SUPPORT"
-	cbStart      = "START"
+	cbBook     = "BOOK"
+	cbConfirm  = "CONFIRM"
+	cbCancel   = "CANCEL"
+	cbHelp     = "HELP"
+	cbSupport  = "SUPPORT"
+	cbStart    = "START"
+	cbMyBook   = "MYBOOK"
 )
 
-// ==================== Helpers ====================
+// ==================== Env loading ====================
 
 func loadEnv(path string) {
 	f, err := os.Open(path)
@@ -88,9 +98,9 @@ func loadEnv(path string) {
 		return
 	}
 	defer f.Close()
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
@@ -102,41 +112,55 @@ func loadEnv(path string) {
 	}
 }
 
-func pingHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprint(w, `{"status":"ok"}`)
+// ==================== Data persistence ====================
+
+func ensureDataDir() {
+	os.MkdirAll(filepath.Join(dataDir, "receipts"), 0o755)
+	os.MkdirAll(filepath.Join(dataDir, "bookings"), 0o755)
 }
 
-func keepAlive(ctx context.Context) {
-	t := time.NewTicker(5 * time.Minute)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			r, err := http.NewRequestWithContext(ctx, "GET", "https://affrbot.onrender.com", nil)
-			if err != nil {
-				continue
+func loadBookings() bookingsFile {
+	path := filepath.Join(dataDir, "bookings", "bookings.json")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return bookingsFile{NextID: 1}
+	}
+	var bf bookingsFile
+	json.Unmarshal(b, &bf)
+	if bf.NextID == 0 {
+		bf.NextID = 1
+	}
+	return bf
+}
+
+func saveBookings(bf bookingsFile) {
+	path := filepath.Join(dataDir, "bookings", "bookings.json")
+	b, _ := json.MarshalIndent(bf, "", "  ")
+	os.WriteFile(path, b, 0o644)
+}
+
+func addBooking(b Booking) Booking {
+	bf := loadBookings()
+	b.ID = bf.NextID
+	bf.NextID++
+	b.CreatedAt = time.Now()
+	bf.Bookings = append(bf.Bookings, b)
+	saveBookings(bf)
+	return b
+}
+
+func updateBookingStatus(id int, status string, receipt string) {
+	bf := loadBookings()
+	for i := range bf.Bookings {
+		if bf.Bookings[i].ID == id {
+			bf.Bookings[i].Status = status
+			if receipt != "" {
+				bf.Bookings[i].ReceiptFile = receipt
 			}
-			resp, err := http.DefaultClient.Do(r)
-			if err != nil {
-				log.Printf("keepAlive ping failed: %v", err)
-				continue
-			}
-			resp.Body.Close()
+			break
 		}
 	}
-}
-
-func cbMsgID(cb *models.CallbackQuery) int {
-	if cb.Message.Message != nil {
-		return cb.Message.Message.ID
-	}
-	if cb.Message.InaccessibleMessage != nil {
-		return cb.Message.InaccessibleMessage.MessageID
-	}
-	return 0
+	saveBookings(bf)
 }
 
 // ==================== Keyboards ====================
@@ -144,8 +168,9 @@ func cbMsgID(cb *models.CallbackQuery) int {
 func mainMenu() *models.InlineKeyboardMarkup {
 	return &models.InlineKeyboardMarkup{
 		InlineKeyboard: [][]models.InlineKeyboardButton{
+			{{Text: "🎟 ቲኬት ይያዙ", CallbackData: cbBook}},
 			{
-				{Text: "🎟 ቲኬት ይያዙ", CallbackData: cbBook},
+				{Text: "📋 የእኔ ቲኬቶች", CallbackData: cbMyBook},
 			},
 			{
 				{Text: "ℹ️ እርዳታ", CallbackData: cbHelp},
@@ -166,7 +191,7 @@ func replyKB() *models.ReplyKeyboardMarkup {
 	}
 }
 
-func confirmKB() *models.InlineKeyboardMarkup {
+func confirmKB(ticket int) *models.InlineKeyboardMarkup {
 	return &models.InlineKeyboardMarkup{
 		InlineKeyboard: [][]models.InlineKeyboardButton{
 			{
@@ -177,55 +202,102 @@ func confirmKB() *models.InlineKeyboardMarkup {
 	}
 }
 
-// ==================== Bot commands ====================
+// ==================== Admin notification ====================
 
-func setupCommands(ctx context.Context, b *bot.Bot) {
-	b.SetMyCommands(ctx, &bot.SetMyCommandsParams{
-		Commands: []models.BotCommand{
-			{Command: "start", Description: "🚀 ቦቱን ይጀምሩ"},
-			{Command: "book", Description: "🎟 ቲኬት ይያዙ"},
-			{Command: "help", Description: "ℹ️ እርዳታ"},
-		},
-	})
+func notifyAdmin(ctx context.Context, b *bot.Bot, msg string) {
+	for _, adminID := range adminIDs {
+		b.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID: adminID,
+			Text:   msg,
+		})
+	}
 }
 
-// ==================== /start ====================
+func notifyAdminPhoto(ctx context.Context, b *bot.Bot, photo *models.InputFileUpload, caption string) {
+	for _, adminID := range adminIDs {
+		b.SendPhoto(ctx, &bot.SendPhotoParams{
+			ChatID:  adminID,
+			Photo:   photo,
+			Caption: caption,
+		})
+	}
+}
 
-func handleStart(ctx context.Context, b *bot.Bot, update *models.Update) {
+// ==================== Handlers ====================
+
+func pingHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"status":"ok"}`)
+}
+
+func startHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 	chatID := update.Message.Chat.ID
 	clearState(chatID)
 
-	// Welcome photo
-	data, err := os.ReadFile("image/having.jpg")
+	fileData, err := os.ReadFile("image/having.jpg")
 	if err == nil {
-		photo := &models.InputFileUpload{Filename: "having.jpg", Data: bytes.NewReader(data)}
 		b.SendPhoto(ctx, &bot.SendPhotoParams{
 			ChatID:  chatID,
-			Photo:   photo,
+			Photo:   &models.InputFileUpload{Filename: "having.jpg", Data: bytes.NewReader(fileData)},
 			Caption: "🎟 ትኬት ይግዙ iPhone 17 Pro Max ይሸለሙ! 📱\n\nየ1 ቲኬት ዋጋ = 500 ብር 💰\n\n🏆 1ኛ እጣ = iPhone 17 Pro Max\n🥈 2ኛ እጣ = 20,000 ብር\n🥉 3ኛ እጣ = 10,000 ብር\n\n✅ ሁሉም በቴሌግራም ውስጥ ይከናወናል!",
 			ReplyMarkup: mainMenu(),
 		})
 	} else {
 		b.SendMessage(ctx, &bot.SendMessageParams{
 			ChatID:      chatID,
-			Text:        "🎟 ትኬት ይግዙ iPhone 17 Pro Max ይሸለሙ! 📱\n\nየ1 ቲኬት ዋጋ = 500 ብር 💰\n\n🏆 1ኛ እጣ = iPhone 17 Pro Max\n🥈 2ኛ እጣ = 20,000 ብር\n🥉 3ኛ እጣ = 10,000 ብር\n\n✅ ሁሉም በቴሌግራም ውስጥ ይከናወናል!",
+			Text:        "🎟 ትኬት ይግዙ iPhone 17 Pro Max ይሸለሙ! 📱\n\nየ1 ቲኬት ዋጋ = 500 ብር 💰\n\n🏆 1ኛ እጣ = iPhone 17 Pro Max\n🥈 2ኛ እጣ = 20,000 ብር\n🥉 3ኛ እጣ = 10,000 ብር",
 			ReplyMarkup: mainMenu(),
 		})
 	}
 
-	// Persistent keyboard
 	b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID:      chatID,
 		Text:        "👇 ለመጀመር ከታች ያለውን ቁልፍ ይጠቀሙ",
 		ReplyMarkup: replyKB(),
 	})
+
+	// Send deposit video
+	f, err := os.Open("afro equb deposit.mp4")
+	if err == nil {
+		defer f.Close()
+		b.SendVideo(ctx, &bot.SendVideoParams{
+			ChatID:  chatID,
+			Video:   &models.InputFileUpload{Filename: "deposit.mp4", Data: f},
+			Caption: "🎥 ክፍያ እንዴት እንደሚፈጽሙ የሚያሳይ አጫጭር ቪዲዮ",
+		})
+	}
 }
 
-// ==================== /book ====================
+func helpHandler(ctx context.Context, b *bot.Bot, chatID int64) {
+	b.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID: chatID,
+		Text: "🎟 ትኬት ለመግዛት ይሄንን ቀላል መንገድ ይከተሉ!\n\n" +
+			"1️⃣ «🎟 ቲኬት ይያዙ» ቁልፍ ይንኩ\n" +
+			"2️⃣ ትኬት ቁጥርዎን ይፃፉ\n" +
+			"3️⃣ ስልክ ቁጥርዎን ይፃፉ\n" +
+			"4️⃣ 500 ብር ወደ " + paymentAcct + " ያስረክቡ\n" +
+			"5️⃣ ደረሰኝ screenshot ይላኩ\n\n" +
+			"✅ ክፍያዎ ከተረጋገጠ ቲኬትዎ ይቀመጣል!\n\n" +
+			"ለማንኛውም ጥያቄ @" + strings.TrimPrefix(supportURL, "https://t.me/"),
+		ReplyMarkup: mainMenu(),
+	})
+}
 
-func handleBook(ctx context.Context, b *bot.Bot, chatID int64) {
-	setState(chatID, &State{Step: AwaitTicket})
+func supportHandler(ctx context.Context, b *bot.Bot, chatID int64) {
+	b.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID: chatID,
+		Text:   "ማንኛውም ጥያቄ ካለ ደላላችንን ያግኙን! 🙏",
+		ReplyMarkup: &models.InlineKeyboardMarkup{
+			InlineKeyboard: [][]models.InlineKeyboardButton{
+				{{Text: "💬 ደላላችንን ያግኙን", URL: supportURL}},
+				{{Text: "🔙 ወደ ዋና ገጽ", CallbackData: cbStart}},
+			},
+		},
+	})
+}
 
+func bookHandler(ctx context.Context, b *bot.Bot, chatID int64) {
+	setState(chatID, &UserState{Step: AwaitNum})
 	b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: chatID,
 		Text:   "🎟 እባክዎ መряይ የሚሹትን ትኬት ቁጥር ይፃፉ\n\n📝 ለምሳሌ፡ 42",
@@ -237,267 +309,227 @@ func handleBook(ctx context.Context, b *bot.Bot, chatID int64) {
 	})
 }
 
-// ==================== /help ====================
-
-func handleHelp(ctx context.Context, b *bot.Bot, chatID int64) {
-	b.SendMessage(ctx, &bot.SendMessageParams{
-		ChatID: chatID,
-		Text: "🎟 ትኬት ለመግዛት ይሄንን ቀላል መንገድ ይከተሉ!\n\n" +
-			"1️⃣ «🎟 ቲኬት ይያዙ» ቁልፍ ይንኩ\n" +
-			"2️⃣ ትኬት ቁጥርዎን ይፃፉ\n" +
-			"3️⃣ 500 ብር ወደ 0955885207 ያስረክቡ\n" +
-			"4️⃣ ደረሰኝ screenshot ይላኩ\n\n" +
-			"✅ ክፍያዎ ከተረጋገጠ ቲኬትዎ ይቀመጣል!\n\n" +
-			"ለማንኛውም ጥያቄ @afroequb",
-	})
-}
-
-// ==================== Callback handler ====================
-
-func handleCallback(ctx context.Context, b *bot.Bot, update *models.Update) {
-	cb := update.CallbackQuery
-	chatID := cb.Message.Message.Chat.ID
-	msgID := cbMsgID(cb)
-	data := cb.Data
-
-	// Always acknowledge
-	b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{
-		CallbackQueryID: cb.ID,
-	})
-
-	switch data {
-
-	case cbStart:
-		clearState(chatID)
-		b.EditMessageText(ctx, &bot.EditMessageTextParams{
-			ChatID:      chatID,
-			MessageID:   msgID,
-			Text:        "🎟 እንደገና ይጀምሩ!",
-			ReplyMarkup: mainMenu(),
-		})
-
-	case cbHelp:
-		sendDepositVideo(ctx, b, chatID)
-
-	case cbSupport:
-		b.EditMessageText(ctx, &bot.EditMessageTextParams{
-			ChatID:    chatID,
-			MessageID: msgID,
-			Text:      "ማንኛውም ጥያቄ ካለ ደላላችንን ያግኙን! 🙏",
-			ReplyMarkup: &models.InlineKeyboardMarkup{
-				InlineKeyboard: [][]models.InlineKeyboardButton{
-					{{Text: "💬 ደላላችንን ያግኙን", URL: supportURL}},
-					{{Text: "🔙 ወደ ዋና ገጽ", CallbackData: cbStart}},
-				},
-			},
-		})
-
-	case cbBook:
-		// Set state and send the ticket number prompt
-		setState(chatID, &State{Step: AwaitTicket})
-		b.EditMessageText(ctx, &bot.EditMessageTextParams{
-			ChatID:    chatID,
-			MessageID: msgID,
-			Text:      "🎟 እባክዎ መряይ የሚሹትን ትኬት ቁጥር ይፃፉ\n\n📝 ለምሳሌ፡ 42",
-			ReplyMarkup: &models.InlineKeyboardMarkup{
-				InlineKeyboard: [][]models.InlineKeyboardButton{
-					{{Text: "❌ ሰርዝ", CallbackData: cbCancel}},
-				},
-			},
-		})
-
-	case cbCancel:
-		clearState(chatID)
-		b.EditMessageText(ctx, &bot.EditMessageTextParams{
-			ChatID:      chatID,
-			MessageID:   msgID,
-			Text:        "✅ ተ 취ልቷል።",
-			ReplyMarkup: mainMenu(),
-		})
-
-	case cbConfirm:
-		// User confirmed — reserve the ticket
-		st := getState(chatID)
-		if st == nil || st.Step != AwaitConfirm {
-			b.EditMessageText(ctx, &bot.EditMessageTextParams{
-				ChatID:      chatID,
-				MessageID:   msgID,
-				Text:        "⚠️ ጊዜው አልፏል። እንደገና ይጀምሩ።",
-				ReplyMarkup: mainMenu(),
-			})
-			return
+func myBookingsHandler(ctx context.Context, b *bot.Bot, chatID int64) {
+	bf := loadBookings()
+	var my []Booking
+	for _, bk := range bf.Bookings {
+		if bk.UserID == chatID {
+			my = append(my, bk)
 		}
-
-		// Show "processing..."
-		b.EditMessageText(ctx, &bot.EditMessageTextParams{
-			ChatID:    chatID,
-			MessageID: msgID,
-			Text:      "⏳ ትኬትዎ በመረጋገጥ ላይ ነው...",
-		})
-
-		// Reserve
-		paymentID, err := apiReserve(chatID, st.TicketNum, cb.From.FirstName, cb.From.Username)
-		if err != nil {
-			log.Printf("reserve failed: %v", err)
-			b.EditMessageText(ctx, &bot.EditMessageTextParams{
-				ChatID:      chatID,
-				MessageID:   msgID,
-				Text:        fmt.Sprintf("❌ ችግር: %s\n\nእንደገና ይሞክሩ።", err.Error()),
-				ReplyMarkup: mainMenu(),
-			})
-			clearState(chatID)
-			return
-		}
-
-		// Update state
-		setState(chatID, &State{Step: AwaitReceipt, TicketNum: st.TicketNum, PaymentID: paymentID})
-
-		// Show payment details
-		b.EditMessageText(ctx, &bot.EditMessageTextParams{
-			ChatID:    chatID,
-			MessageID: msgID,
-			Text: fmt.Sprintf(
-				"✅ ትኬት #%d ተርፏል!\n\n"+
-					"💳 የክፍያ መረጃ:\n"+
-					"📱 Telebirr: 0955885207\n"+
-					"👤 ስም: yirgalem\n"+
-					"💰 መጠን: 500 ብር\n\n"+
-					"📸 ከተከፈተሉ በኋላ የክፍያ ደረሰኝ screenshot ይላኩ።",
-				st.TicketNum,
-			),
-			ReplyMarkup: &models.InlineKeyboardMarkup{
-				InlineKeyboard: [][]models.InlineKeyboardButton{
-					{{Text: "📸 ደረሰኝ በዚህ ላይ ይላኩ", WebApp: &models.WebAppInfo{URL: miniAppURL}}},
-				},
-			},
-		})
 	}
-}
-
-func sendDepositVideo(ctx context.Context, b *bot.Bot, chatID int64) {
-	f, err := os.Open("afro equb deposit.mp4")
-	if err != nil {
-		// No video file — just send text
+	if len(my) == 0 {
 		b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: chatID,
-			Text: "🎟 ትኬት ለመግዛት ይሄንን ቀላል መንገድ ይከተሉ!\n\n" +
-				"1️⃣ «🎟 ቲኬት ይያዙ» ቁልፍ ይንኩ\n" +
-				"2️⃣ ትኬት ቁጥርዎን ይፃፉ\n" +
-				"3️⃣ 500 ብር ወደ 0955885207 ያስረክቡ\n" +
-				"4️⃣ ደረሰኝ screenshot ይላኩ\n\n" +
-				"✅ ክፍያዎ ከተረጋገጠ ቲኬትዎ ይቀመጣል!\n\n" +
-				"ለማንኛውም ጥያቄ @afroequb",
+			ChatID:      chatID,
+			Text:        "📋 ምንም ቲኬት የለዎትም።\n\n🎟 ቲኬት ለመያዝ ከታች ቁልፍ ይንኩ!",
 			ReplyMarkup: mainMenu(),
 		})
 		return
 	}
-	defer f.Close()
-
-	video := &models.InputFileUpload{Filename: "afro equb deposit.mp4", Data: f}
-	b.SendVideo(ctx, &bot.SendVideoParams{
+	var sb strings.Builder
+	sb.WriteString("📋 የእኔ ቲኬቶች:\n\n")
+	for _, bk := range my {
+		status := "⏳ ማረጋገጫ በመጠበቅ ላይ"
+		if bk.Status == "CONFIRMED" {
+			status = "✅ ተረጋግጧል"
+		}
+		sb.WriteString(fmt.Sprintf("🎟 #%d | %s | %s\n", bk.TicketNum, bk.UserPhone, status))
+	}
+	b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID:      chatID,
-		Video:       video,
-		Caption:     "🎥 ክፍያ እንዴት እንደሚፈጽሙ የሚያሳይ አጫጭር ቪዲዮ",
+		Text:        sb.String(),
 		ReplyMarkup: mainMenu(),
 	})
 }
 
-// ==================== Text handler ====================
+func callbackHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
+	cb := update.CallbackQuery
+	chatID := cb.Message.Message.Chat.ID
+	msgID := cb.Message.Message.ID
 
-func handleText(ctx context.Context, b *bot.Bot, update *models.Update) {
+	b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{CallbackQueryID: cb.ID})
+
+	switch cb.Data {
+	case cbStart:
+		clearState(chatID)
+		b.EditMessageText(ctx, &bot.EditMessageTextParams{
+			ChatID: chatID, MessageID: msgID,
+			Text: "🎟 እንደገና ይጀምሩ!", ReplyMarkup: mainMenu(),
+		})
+	case cbHelp:
+		helpHandler(ctx, b, chatID)
+	case cbSupport:
+		supportHandler(ctx, b, chatID)
+	case cbBook:
+		clearState(chatID)
+		setState(chatID, &UserState{Step: AwaitNum})
+		b.EditMessageText(ctx, &bot.EditMessageTextParams{
+			ChatID: chatID, MessageID: msgID, Text: "🎟 እባክዎ መряይ የሚሹትን ትኬት ቁጥር ይፃፉ\n\n📝 ለምሳሌ፡ 42",
+			ReplyMarkup: &models.InlineKeyboardMarkup{InlineKeyboard: [][]models.InlineKeyboardButton{
+				{{Text: "❌ ሰርዝ", CallbackData: cbCancel}},
+			}},
+		})
+	case cbCancel:
+		clearState(chatID)
+		b.EditMessageText(ctx, &bot.EditMessageTextParams{
+			ChatID: chatID, MessageID: msgID, Text: "✅ ተ취ልቷል።", ReplyMarkup: mainMenu(),
+		})
+	case cbMyBook:
+		myBookingsHandler(ctx, b, chatID)
+	case cbConfirm:
+		st := getState(chatID)
+		if st == nil || st.Step != AwaitConfirm {
+			b.EditMessageText(ctx, &bot.EditMessageTextParams{
+				ChatID: chatID, MessageID: msgID, Text: "⚠️ ጊዜው አልፏል። እንደገና ይጀምሩ።",
+				ReplyMarkup: mainMenu(),
+			})
+			return
+		}
+
+		b.EditMessageText(ctx, &bot.EditMessageTextParams{
+			ChatID: chatID, MessageID: msgID, Text: "⏳ ትኬትዎ በመመዝገብ ላይ ነው...",
+		})
+
+		// Create booking
+		user := cb.From
+		name := user.FirstName
+		if user.LastName != "" {
+			name += " " + user.LastName
+		}
+		bk := addBooking(Booking{
+			UserID:    chatID,
+			UserName:  name,
+			UserPhone: st.Phone,
+			TicketNum: st.Ticket,
+			Status:    "PENDING",
+		})
+
+		// Update state to await receipt
+		setState(chatID, &UserState{Step: AwaitReceipt, Ticket: st.Ticket, Phone: st.Phone})
+
+		// Notify admin
+		notifyAdmin(ctx, b, fmt.Sprintf(
+			"🆕 አዲስ ትኬት ቀይቧል!\n\n"+
+				"🎟 ትኬት: #%d\n"+
+				"👤 ስም: %s\n"+
+				"📱 ስልክ: %s\n"+
+				"🆔 ቴሌግራም: %d\n"+
+				"📋 ቦታ: %d\n\n"+
+				"⏳ የክፍያ ደረሰኝ በመጠበቅ ላይ...",
+			st.Ticket, name, st.Phone, chatID, bk.ID,
+		))
+
+		paymentText := fmt.Sprintf(
+			"✅ ትኬት #%d ተመዝግቧል!\n\n"+
+				"💳 የክፍያ መረጃ:\n"+
+				"📱 Telebirr: %s\n"+
+				"👤 ስም: %s\n"+
+				"💰 መጠን: %d ብር\n\n"+
+				"📸 ከተከፈተሉ በኋላ የክፍያ ደረሰኝ screenshot ይላኩ።\n\n"+
+				"⚠️ እባክዎ ትኬት ቁጥር #%d ብቻ ያስረክቡ!",
+			st.Ticket, paymentAcct, paymentName, price, st.Ticket,
+		)
+		b.EditMessageText(ctx, &bot.EditMessageTextParams{
+			ChatID: chatID, MessageID: msgID, Text: paymentText,
+		})
+	}
+}
+
+func textHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 	text := strings.TrimSpace(update.Message.Text)
 	lower := strings.ToLower(text)
 	chatID := update.Message.Chat.ID
 
 	// Reply keyboard buttons
 	switch {
-	case strings.Contains(lower, "ትኬት") || lower == "/book" || lower == "book":
-		handleBook(ctx, b, chatID)
+	case strings.Contains(lower, "ትኬት") || lower == "/book":
+		bookHandler(ctx, b, chatID)
 		return
-	case strings.Contains(lower, "እርዳታ") || lower == "/help" || lower == "help":
-		handleHelp(ctx, b, chatID)
+	case strings.Contains(lower, "እርዳታ") || lower == "/help":
+		helpHandler(ctx, b, chatID)
 		return
 	case strings.Contains(lower, "ድጋፍ") || strings.Contains(lower, "support"):
+		supportHandler(ctx, b, chatID)
+		return
+	}
+
+	st := getState(chatID)
+	if st == nil {
 		b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: chatID,
-			Text:   "ማንኛውም ጥያቄ ካለ ደላላችንን ያግኙን! 🙏",
-			ReplyMarkup: &models.InlineKeyboardMarkup{
-				InlineKeyboard: [][]models.InlineKeyboardButton{
-					{{Text: "💬 ደላላችንን ያግኙን", URL: supportURL}},
-					{{Text: "🔙 ወደ ዋና ገጽ", CallbackData: cbStart}},
-				},
-			},
+			ChatID: chatID, Text: "To book a ticket, type /book or tap the button 👇",
+			ReplyMarkup: replyKB(),
 		})
 		return
 	}
 
-	// Booking conversational step
-	st := getState(chatID)
-	if st != nil && st.Step == AwaitTicket {
+	switch st.Step {
+	case AwaitNum:
 		num, err := strconv.Atoi(text)
-		if err != nil || num < 1 {
+		if err != nil || num < 1 || num > 5000 {
 			b.SendMessage(ctx, &bot.SendMessageParams{
-				ChatID: chatID,
-				Text:   "⚠️ እባክዎ ትክክለኛ ቁጥር ይፃፉ (ለምሳሌ፡ 42)",
+				ChatID: chatID, Text: "⚠️ እባክዎ ትክክለኛ ቁጥር ይፃፉ (1-5000)\n\n📝 ለምሳሌ፡ 42",
 			})
 			return
 		}
 
-		// Check availability
-		available, msg, err := apiCheckAvailability(num)
-		if err != nil {
-			log.Printf("availability check error: %v", err)
+		// Check if already taken
+		bf := loadBookings()
+		for _, bk := range bf.Bookings {
+			if bk.TicketNum == num && bk.Status != "CANCELLED" {
+				b.SendMessage(ctx, &bot.SendMessageParams{
+					ChatID: chatID, Text: fmt.Sprintf("❌ ትኬት #%d አይደልም። ሌላ ቁጥር ይሞክሩ።", num),
+					ReplyMarkup: mainMenu(),
+				})
+				clearState(chatID)
+				return
+			}
+		}
+
+		// Ask for phone
+		setState(chatID, &UserState{Step: AwaitPhone, Ticket: num})
+		b.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID: chatID,
+			Text:   fmt.Sprintf("📱 ትኬት #%d ተመርጧል!\n\nእባክዎ ስልክ ቁጥርዎን ይፃፉ\n\n📝 ለምሳሌ፡ 0911223344", num),
+			ReplyMarkup: &models.InlineKeyboardMarkup{InlineKeyboard: [][]models.InlineKeyboardButton{
+				{{Text: "❌ ሰርዝ", CallbackData: cbCancel}},
+			}},
+		})
+
+	case AwaitPhone:
+		// Basic phone validation
+		cleaned := strings.ReplaceAll(strings.ReplaceAll(text, " ", ""), "-", "")
+		if len(cleaned) < 9 || len(cleaned) > 12 {
 			b.SendMessage(ctx, &bot.SendMessageParams{
-				ChatID: chatID,
-				Text: fmt.Sprintf(
-					"⚠️ ችግር ተፈጥሯል: %s\n\n"+
-						"እባክዎ እንደገና ይሞክሩ ወይም @afroequb ያነጋግሩን።",
-					err.Error(),
-				),
-				ReplyMarkup: mainMenu(),
+				ChatID: chatID, Text: "⚠️ እባክዎ ትክክለኛ ስልክ ቁጥር ይፃፉ\n\n📝 ለምሳሌ፡ 0911223344",
 			})
-			clearState(chatID)
 			return
 		}
 
-		if !available {
-			b.SendMessage(ctx, &bot.SendMessageParams{
-				ChatID:      chatID,
-				Text:        fmt.Sprintf("❌ ትኬት #%d አይደልም: %s\n\nሌላ ቁጥር ይሞክሩ።", num, msg),
-				ReplyMarkup: mainMenu(),
-			})
-			clearState(chatID)
-			return
-		}
+		st.Phone = text
+		st.Step = AwaitConfirm
+		setState(chatID, st)
 
-		// Available — show confirmation
-		setState(chatID, &State{Step: AwaitConfirm, TicketNum: num})
 		b.SendMessage(ctx, &bot.SendMessageParams{
 			ChatID: chatID,
 			Text: fmt.Sprintf(
 				"📋 ትኬት ማረጋገጫ:\n\n"+
 					"🎟 ትኬት: #%d\n"+
-					"💰 ዋጋ: 500 ብር\n"+
-					"📱 Telebirr: 0955885207\n\n"+
+					"📱 ስልክ: %s\n"+
+					"💰 ዋጋ: %d ብር\n\n"+
 					"ይህን ትኬት መያዝ ይፈልጋሉ?",
-				num,
+				st.Ticket, st.Phone, price,
 			),
-			ReplyMarkup: confirmKB(),
+			ReplyMarkup: confirmKB(st.Ticket),
 		})
-		return
-	}
 
-	// Fallback
-	b.SendMessage(ctx, &bot.SendMessageParams{
-		ChatID:      chatID,
-		Text:        "To book a ticket, tap /book or the button below 👇",
-		ReplyMarkup: replyKB(),
-	})
+	case AwaitReceipt:
+		b.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID: chatID,
+			Text:   "📸 እባክዎ የክፍያ ደረሰኝ screenshot ይላኩ።",
+		})
+	}
 }
 
-// ==================== Photo handler ====================
-
-func handlePhoto(ctx context.Context, b *bot.Bot, update *models.Update) {
+func photoHandler(ctx context.Context, b *bot.Bot, update *models.Update) {
 	chatID := update.Message.Chat.ID
 	st := getState(chatID)
 
@@ -515,203 +547,82 @@ func handlePhoto(ctx context.Context, b *bot.Bot, update *models.Update) {
 	}
 	largest := photos[len(photos)-1]
 
-	// Download from Telegram
+	// Download photo from Telegram
 	file, err := b.GetFile(ctx, &bot.GetFileParams{FileID: largest.FileID})
 	if err != nil {
 		log.Printf("GetFile failed: %v", err)
-		b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: chatID,
-			Text:   "⚠️ ፎቶውን ማስኬድ አልተቻለም። እንደገና ይሞክሩ።",
-		})
+		b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "⚠️ ፎቶውን ማስኬድ አልተቻለም። እንደገና ይሞክሩ።"})
 		return
 	}
 
-	dlURL := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", botToken, file.FilePath)
+	dlURL := fmt.Sprintf("https://api.telegram.org/file/bot%s/%s", botTokenStr, file.FilePath)
 	resp, err := http.Get(dlURL)
 	if err != nil {
 		log.Printf("download photo failed: %v", err)
-		b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: chatID,
-			Text:   "⚠️ ፎቶውን ማውረድ አልተቻለም። እንደገና ይሞክሩ።",
-		})
+		b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "⚠️ ፎቶውን ማውረድ አልተቻለም። እንደገና ይሞክሩ።"})
 		return
 	}
 	defer resp.Body.Close()
 
-	// Upload receipt
-	err = apiUploadReceipt(st.PaymentID, resp.Body, "receipt.jpg")
+	// Save receipt locally
+	receiptPath := filepath.Join(dataDir, "receipts", fmt.Sprintf("receipt_%d_%d.jpg", chatID, st.Ticket))
+	outFile, err := os.Create(receiptPath)
 	if err != nil {
-		log.Printf("upload receipt failed: %v", err)
-		b.SendMessage(ctx, &bot.SendMessageParams{
-			ChatID: chatID,
-			Text:   fmt.Sprintf("⚠️ ደረሰኝ ማስኬድ አልተቻለም: %s\n\nእንደገና ይሞክሩ።", err.Error()),
-		})
+		log.Printf("create receipt file failed: %v", err)
+		b.SendMessage(ctx, &bot.SendMessageParams{ChatID: chatID, Text: "⚠️ ደረሰኝ ማስኬድ አልተቻለም።"})
 		return
 	}
+	defer outFile.Close()
+	io.Copy(outFile, resp.Body)
+
+	// Find and update booking
+	bf := loadBookings()
+	for i := range bf.Bookings {
+		if bf.Bookings[i].UserID == chatID && bf.Bookings[i].TicketNum == st.Ticket && bf.Bookings[i].Status == "PENDING" {
+			bf.Bookings[i].Status = "PAID"
+			bf.Bookings[i].ReceiptFile = receiptPath
+			break
+		}
+	}
+	saveBookings(bf)
 
 	clearState(chatID)
+
+	// Send receipt to admin
+	f, err := os.Open(receiptPath)
+	if err == nil {
+		defer f.Close()
+		for _, adminID := range adminIDs {
+			b.SendPhoto(ctx, &bot.SendPhotoParams{
+				ChatID:  adminID,
+				Photo:   &models.InputFileUpload{Filename: "receipt.jpg", Data: f},
+				Caption: fmt.Sprintf(
+					"📸 የክፍያ ደረሰኝ!\n\n"+
+						"🎟 ትኬት: #%d\n"+
+						"📱 ስልክ: %s\n"+
+						"👤 ስም: %s\n"+
+						"🆔 ቴሌግራም: %d\n\n"+
+						"✅ ክፍያ ተረጋግጧል!",
+					st.Ticket, st.Phone,
+					func() string {
+						u := update.Message.From
+						n := u.FirstName
+						if u.LastName != "" {
+							n += " " + u.LastName
+						}
+						return n
+					}(),
+					chatID,
+				),
+			})
+		}
+	}
+
 	b.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID:      chatID,
-		Text:        fmt.Sprintf("🎉 ደረሰኝ ተስርፏል! ትኬት #%d ማረጋገጫ በመጠበቅ ላይ ነው።\n\n✅ ከተረጋገጠ በኋላ ትኬትዎ ይቀመጣል።", st.TicketNum),
+		Text:        fmt.Sprintf("🎉 ደረሰኝ ተስርፏል! ትኬት #%d ማረጋገጫ በመጠበቅ ላይ ነው።\n\n✅ ከተረጋገጠ በኋላ ትኬትዎ ይቀመጣል።\n\nለማንኛውም ጥያቄ @afroequb", st.Ticket),
 		ReplyMarkup: mainMenu(),
 	})
-}
-
-// ==================== API calls ====================
-
-func apiCheckAvailability(ticketNum int) (bool, string, error) {
-	payload := map[string]interface{}{
-		"ticket_number": ticketNum,
-		"bot_token":     os.Getenv("BOT_API_SECRET"),
-	}
-	body, _ := json.Marshal(payload)
-
-	url := apiBase + "/ticket/availability"
-	log.Printf("API checkAvailability: POST %s body=%s", url, string(body))
-
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
-	if err != nil {
-		return false, "", fmt.Errorf(" Cannot reach server. Please try again later. (%w)", err)
-	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-	log.Printf("API checkAvailability: status=%d body=%s", resp.StatusCode, string(respBody))
-
-	if resp.StatusCode != 200 {
-		return false, "", fmt.Errorf("Server error (HTTP %d). Please try again.", resp.StatusCode)
-	}
-
-	var result struct {
-		Available bool   `json:"available"`
-		Message   string `json:"message"`
-		Status    string `json:"status"`
-	}
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return false, "", fmt.Errorf("Unexpected server response. Please try again.")
-	}
-
-	msg := result.Message
-	if msg == "" {
-		msg = result.Status
-	}
-	return result.Available, msg, nil
-}
-
-func apiReserve(chatID int64, ticketNum int, firstName, username string) (int, error) {
-	payload := map[string]interface{}{
-		"telegram_id":   chatID,
-		"ticket_number": ticketNum,
-		"bot_token":     os.Getenv("BOT_API_SECRET"),
-		"first_name":    firstName,
-		"username":      username,
-	}
-	body, _ := json.Marshal(payload)
-
-	url := apiBase + "/ticket/reserve"
-	log.Printf("API reserve: POST %s body=%s", url, string(body))
-
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
-	if err != nil {
-		return 0, fmt.Errorf("Cannot reach server. Please try again later.")
-	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-	log.Printf("API reserve: status=%d body=%s", resp.StatusCode, string(respBody))
-
-	if resp.StatusCode != 200 {
-		return 0, fmt.Errorf("Server error (HTTP %d). Please try again.", resp.StatusCode)
-	}
-
-	var result struct {
-		Success   bool   `json:"success"`
-		Message   string `json:"message"`
-		PaymentID int    `json:"payment_id"`
-	}
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return 0, fmt.Errorf("Unexpected server response.")
-	}
-	if !result.Success {
-		return 0, fmt.Errorf(result.Message)
-	}
-	return result.PaymentID, nil
-}
-
-func apiUploadReceipt(paymentID int, reader io.Reader, filename string) error {
-	var buf bytes.Buffer
-	w := multipart.NewWriter(&buf)
-
-	part, err := w.CreateFormFile("receipt", filename)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(part, reader); err != nil {
-		return err
-	}
-	w.WriteField("payment_id", strconv.Itoa(paymentID))
-	w.WriteField("bot_token", os.Getenv("BOT_API_SECRET"))
-	w.Close()
-
-	url := apiBase + "/ticket/upload-receipt"
-	log.Printf("API uploadReceipt: POST %s payment_id=%d", url, paymentID)
-
-	req, err := http.NewRequest("POST", url, &buf)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", w.FormDataContentType())
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("Cannot reach server. Please try again later.")
-	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-	log.Printf("API uploadReceipt: status=%d body=%s", resp.StatusCode, string(respBody))
-
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("Server error (HTTP %d). Please try again.", resp.StatusCode)
-	}
-
-	var result struct {
-		Success bool   `json:"success"`
-		Message string `json:"message"`
-	}
-	if err := json.Unmarshal(respBody, &result); err != nil {
-		return fmt.Errorf("Unexpected server response.")
-	}
-	if !result.Success {
-		return fmt.Errorf(result.Message)
-	}
-	return nil
-}
-
-// ==================== Health check ====================
-
-func healthCheck() {
-	url := apiBase + "/ticket/availability"
-	payload := map[string]interface{}{"ticket_number": 1, "bot_token": "health_check"}
-	body, _ := json.Marshal(payload)
-
-	log.Printf("Running API health check: POST %s", url)
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
-	if err != nil {
-		log.Printf("⚠️  HEALTH CHECK FAILED: Cannot reach API at %s: %v", apiBase, err)
-		log.Printf("⚠️  Make sure WEBAPP_API_BASE env var is set correctly in .env")
-		return
-	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-	log.Printf("API health check: status=%d body=%s", resp.StatusCode, string(respBody))
-
-	if resp.StatusCode == 200 || resp.StatusCode == 403 {
-		log.Printf("✅ API is reachable at %s", apiBase)
-	} else {
-		log.Printf("⚠️  API returned unexpected status %d", resp.StatusCode)
-	}
 }
 
 // ==================== Main ====================
@@ -719,41 +630,40 @@ func healthCheck() {
 func main() {
 	loadEnv(".env")
 
-	botToken = os.Getenv("TELEGRAM_BOT_TOKEN")
-	if botToken == "" {
-		log.Fatal("❌ TELEGRAM_BOT_TOKEN is required in .env")
+	botTokenStr = os.Getenv("TELEGRAM_BOT_TOKEN")
+	if botTokenStr == "" {
+		log.Fatal("❌ TELEGRAM_BOT_TOKEN is required")
 	}
 
 	if v := os.Getenv("MINIAPP_URL"); v != "" {
 		miniAppURL = v
 	}
-	if v := os.Getenv("WEBAPP_API_BASE"); v != "" {
-		apiBase = v
+	if v := os.Getenv("TELEGRAM_ADMIN_IDS"); v != "" {
+		for _, s := range strings.Split(v, ",") {
+			s = strings.TrimSpace(s)
+			if id, err := strconv.ParseInt(s, 10, 64); err == nil {
+				adminIDs = append(adminIDs, id)
+			}
+		}
 	}
 
-	log.Printf("Config: API=%s MiniApp=%s", apiBase, miniAppURL)
+	ensureDataDir()
+	log.Printf("Admin IDs: %v", adminIDs)
 
-	// Health check the API before starting
-	healthCheck()
-
-	ctx := context.Background()
-	go keepAlive(ctx)
-
-	// HTTP server for keep-alive ping
+	// HTTP keep-alive server
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "3000"
 	}
 	http.HandleFunc("/", pingHandler)
 	go func() {
-		log.Printf("HTTP server starting on :%s", port)
-		if err := http.ListenAndServe(":"+port, nil); err != nil {
-			log.Fatalf("HTTP server failed: %v", err)
-		}
+		log.Printf("HTTP on :%s", port)
+		http.ListenAndServe(":"+port, nil)
 	}()
 
-	// Create bot
-	b, err := bot.New(botToken)
+	ctx := context.Background()
+
+	b, err := bot.New(botTokenStr)
 	if err != nil {
 		log.Fatalf("Failed to create bot: %v", err)
 	}
@@ -762,33 +672,38 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to getMe: %v", err)
 	}
-	log.Printf("✅ Bot authorized: @%s", me.Username)
+	log.Printf("✅ Bot: @%s", me.Username)
 
-	// Register handlers
-	// 1. Commands first
-	b.RegisterHandler(bot.HandlerTypeMessageText, "start", bot.MatchTypeCommand, handleStart)
+	// Commands
+	b.RegisterHandler(bot.HandlerTypeMessageText, "start", bot.MatchTypeCommand, startHandler)
 	b.RegisterHandler(bot.HandlerTypeMessageText, "book", bot.MatchTypeCommand, func(ctx context.Context, b *bot.Bot, update *models.Update) {
-		handleBook(ctx, b, update.Message.Chat.ID)
+		bookHandler(ctx, b, update.Message.Chat.ID)
 	})
 	b.RegisterHandler(bot.HandlerTypeMessageText, "help", bot.MatchTypeCommand, func(ctx context.Context, b *bot.Bot, update *models.Update) {
-		handleHelp(ctx, b, update.Message.Chat.ID)
+		helpHandler(ctx, b, update.Message.Chat.ID)
 	})
 
-	// 2. Callback queries (inline keyboard buttons)
+	// Callbacks
 	b.RegisterHandlerMatchFunc(func(update *models.Update) bool {
 		return update.CallbackQuery != nil
-	}, handleCallback)
+	}, callbackHandler)
 
-	// 3. Photos for receipt upload
+	// Photos
 	b.RegisterHandlerMatchFunc(func(update *models.Update) bool {
 		return update.Message != nil && len(update.Message.Photo) > 0
-	}, handlePhoto)
+	}, photoHandler)
 
-	// 4. Text messages (catch-all, must be last)
-	b.RegisterHandler(bot.HandlerTypeMessageText, "", bot.MatchTypeContains, handleText)
+	// Text (catch-all, last)
+	b.RegisterHandler(bot.HandlerTypeMessageText, "", bot.MatchTypeContains, textHandler)
 
-	setupCommands(ctx, b)
-	log.Printf("🚀 Bot is running! Send /start to @%s to test.", me.Username)
+	b.SetMyCommands(ctx, &bot.SetMyCommandsParams{
+		Commands: []models.BotCommand{
+			{Command: "start", Description: "🚀 ቦቱን ይጀምሩ"},
+			{Command: "book", Description: "🎟 ቲኬት ይያዙ"},
+			{Command: "help", Description: "ℹ️ እርዳታ"},
+		},
+	})
 
+	log.Printf("🚀 Bot running! Send /start to @%s", me.Username)
 	b.Start(ctx)
 }
